@@ -17,16 +17,12 @@ function activate(context) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('extension.taskSphere', () => {
-            if (!panel) {
+            // Always check if panel is disposed or null before using it
+            if (!panel || panel.disposed) {
                 panel = createWebviewPanel();
             } else {
-                // If panel exists but was closed, create a new one
-                if (panel.disposed) {
-                    panel = createWebviewPanel();
-                } else {
-                    // If panel exists and is not closed, just reveal it
-                    panel.reveal(vscode.ViewColumn.One);
-                }
+                // Panel exists and is not disposed, just reveal it
+                panel.reveal(vscode.ViewColumn.One);
             }
         })
     );
@@ -65,16 +61,24 @@ function connectWebSocket() {
 }
 
 function handleDataUpdate(message) {
+    // Check if panel exists and is not disposed before using it
     if (!panel || panel.disposed) {
-        // Create panel if it doesn't exist or was disposed
-        panel = createWebviewPanel();
+        // Don't automatically create panel here - only create when user explicitly opens it
+        console.log('Panel not available for message update');
+        return;
     }
     
     // Send the updated data to the webview
-    panel.webview.postMessage(message);
+    try {
+        panel.webview.postMessage(message);
+    } catch (error) {
+        console.error('Error posting message to webview:', error);
+        // If there's an error, the panel might be disposed
+        panel = null;
+    }
 }
 
-function createWebviewPanel(context) {
+function createWebviewPanel() {
     // Create and show panel
     const newPanel = vscode.window.createWebviewPanel(
         'taskSphere',
@@ -95,7 +99,11 @@ function createWebviewPanel(context) {
             vscode.window.showErrorMessage('Gagal memuat report.html');
             return;
         }
-        newPanel.webview.html = data;
+        
+        // Check if panel is still valid before setting HTML
+        if (!newPanel.disposed) {
+            newPanel.webview.html = data;
+        }
     });
     
     // Handle messages from the webview
@@ -110,9 +118,11 @@ function createWebviewPanel(context) {
         extensionContext.subscriptions
     );
     
-    // Handle panel disposal
+    // Handle panel disposal - THIS IS CRITICAL
     newPanel.onDidDispose(() => {
-        // You can handle cleanup here if needed
+        // Set panel to null when it's disposed
+        panel = null;
+        console.log('Panel disposed');
     }, null, extensionContext.subscriptions);
     
     return newPanel;
@@ -121,6 +131,12 @@ function createWebviewPanel(context) {
 function deactivate() {
     if (socket) {
         socket.close();
+    }
+    
+    // Clean up panel reference
+    if (panel) {
+        panel.dispose();
+        panel = null;
     }
 }
 

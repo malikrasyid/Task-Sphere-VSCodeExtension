@@ -116,38 +116,311 @@
         </div>
     </div>
     <script>
-        
-document.addEventListener("DOMContentLoaded", () => {
-    const apiUrl = "https://task-sphere-pi.vercel.app";
-    const wsUrl = "wss://websocket-task-sphere-production.up.railway.app";
+        // Global variables
+        let socket;
+        let projectsSocket;
+        let tasksSocket;
+        let usersSocket;
+        let commentsSocket;
+        let notificationsSocket;
+        let localTasks = JSON.parse(localStorage.getItem("tasks")) || [];
+        let authToken = localStorage.getItem("sessionToken");
+        let currentUser = localStorage.getItem("userId");
+        let calendar;
+        let isOffline = true;
+        const apiUrl = "https://task-sphere-pi.vercel.app";
+        const wsUrl = "wss://websocket-task-sphere-production.up.railway.app";
+        let isWebviewDisposed = false;
 
-    let socket;
-    let projectsSocket;
-    let tasksSocket;
-    let usersSocket;
-    let commentsSocket;
-    let notificationsSocket;
-    let localTasks = JSON.parse(localStorage.getItem("tasks")) || [];
-    let authToken = localStorage.getItem("sessionToken");
-    let currentUser = localStorage.getItem("userId");
-    let calendar;
-    let isOffline = true;
+        // Handle webview messages
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.command) {
+                case 'webviewDisposed':
+                    isWebviewDisposed = true;
+                    // Clean up resources
+                    if (socket) socket.close();
+                    if (projectsSocket) projectsSocket.close();
+                    if (tasksSocket) tasksSocket.close();
+                    if (usersSocket) usersSocket.close();
+                    if (commentsSocket) commentsSocket.close();
+                    if (notificationsSocket) notificationsSocket.close();
+                    break;
+                case 'webviewReady':
+                    isWebviewDisposed = false;
+                    // Reinitialize if needed
+                    initializeApp();
+                    break;
+            }
+        });
 
-    const connectionStatus = document.getElementById("connectionStatus");
-    const statusDot = document.getElementById("statusDot");
-    const statusText = document.getElementById("statusText");
-    const syncButton = document.getElementById("syncButton");
-    const tasksContainer = document.getElementById("tasksContainer");
-    const userStatus = document.getElementById("userStatus");
-    const userInitials = document.getElementById("userInitials");
-    const loginButton = document.getElementById("loginButton");
-    const userStatusContainer = document.getElementById("userStatusContainer");
-    const accountType = document.getElementById("accountType");
-    const calendarTab = document.getElementById("calendarTab");
-    const tasksTab = document.getElementById("tasksTab");
+        // Function to safely show VS Code notifications
+        function showVSCodeNotification(message) {
+            if (!isWebviewDisposed && window.vsCodeApi) {
+                try {
+                    window.vsCodeApi.postMessage({
+                        command: 'showWarning',
+                        text: message
+                    });
+                } catch (error) {
+                    console.error('Failed to show VS Code notification:', error);
+                }
+            }
+        }
 
-    // Set initial connection status
-    updateConnectionStatus(false);
+        // Function to initialize the app
+        function initializeApp() {
+            if (isWebviewDisposed) return;
+
+            // Initialize UI elements
+            connectionStatus = document.getElementById("connectionStatus");
+            statusDot = document.getElementById("statusDot");
+            statusText = document.getElementById("statusText");
+            syncButton = document.getElementById("syncButton");
+            tasksContainer = document.getElementById("tasksContainer");
+            userStatus = document.getElementById("userStatus");
+            userInitials = document.getElementById("userInitials");
+            loginButton = document.getElementById("loginButton");
+            userStatusContainer = document.getElementById("userStatusContainer");
+            accountType = document.getElementById("accountType");
+            calendarTab = document.getElementById("calendarTab");
+            tasksTab = document.getElementById("tasksTab");
+
+            // Set initial states
+            updateConnectionStatus(false);
+            loadLocalData();
+            updateUserStatus();
+            updateSyncButtonState();
+            
+            if (calendar) {
+                renderCalendar();
+            }
+
+            // Start auto-update and deadline checking
+            checkAndUpdateTaskStatuses();
+            startDeadlineChecking();
+
+            // Set up periodic status checks (every 5 minutes)
+            setInterval(checkAndUpdateTaskStatuses, 5 * 60 * 1000);
+
+            // Add event listeners
+            syncButton.addEventListener('click', async () => {
+                await syncTasks();
+            });
+        }
+
+        // Modify checkDeadlines to use safe notification
+        function checkDeadlines() {
+            if (isWebviewDisposed) return;
+            
+            const now = new Date();
+            for (const task of localTasks) {
+                if (task.status === 'Done' || !task.endDate) continue;
+                const endDate = new Date(task.endDate);
+                const timeDiff = endDate - now;
+                
+                if (timeDiff > 0 && timeDiff <= 60 * 60 * 1000) {
+                    showVSCodeNotification(`Task "${task.name}" is due in less than an hour!`);
+                    showNotification(
+                        "Upcoming Deadline",
+                        `Task "${task.name}" is due in less than an hour!`,
+                        "warning"
+                    );
+                }
+            }
+        }
+
+        // Initialize the app
+        document.addEventListener("DOMContentLoaded", () => {
+            // Notify VS Code that webview is ready
+            if (window.vsCodeApi) {
+                window.vsCodeApi.postMessage({ command: 'webviewReady' });
+            }
+            
+            initializeApp();
+        });
+
+        // Clean up when window is unloaded
+        window.addEventListener('unload', () => {
+            if (window.vsCodeApi) {
+                window.vsCodeApi.postMessage({ command: 'webviewDisposed' });
+            }
+        });
+
+        // Auto status update functionality
+        const getAutoStatus = (startDate, endDate) => {
+            // Get current time in UTC
+            if (!startDate || !endDate) return 'Not Started'
+            
+            const now = new Date()
+            
+            // Ensure UTC parsing by adding Z if not present
+            const startUTC = startDate.includes('Z') || startDate.includes('+') ? startDate : startDate + 'Z'
+            const endUTC = endDate.includes('Z') || endDate.includes('+') ? endDate : endDate + 'Z'
+            
+            const start = new Date(startUTC)
+            const end = new Date(endUTC)
+            
+            // Log for debugging
+            console.log('Date comparison:', {
+                now: now.toISOString(),
+                start: start.toISOString(),
+                end: end.toISOString(),
+                startLocal: start.toLocaleString(),
+                endLocal: end.toLocaleString(),
+                nowTime: now.getTime(),
+                startTime: start.getTime(),
+                endTime: end.getTime(),
+                isBeforeStart: now < start,
+                isAfterEnd: now > end
+            })
+            
+            if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+                console.error('Invalid date detected:', { startDate, endDate })
+                return 'Not Started'
+            }
+            
+            if (now < start) {
+                console.log('Status: Not Started (now < start)')
+                return 'Not Started'
+            } else if (now > end) {
+                console.log('Status: Overdue (now > end)')
+                return 'Overdue'
+            } else {
+                console.log('Status: Ongoing (start <= now <= end)')
+                return 'Ongoing'
+            }
+        }
+
+        // Function to sync task status
+        async function syncTask(projectId, taskId, newStatus) {
+            try {
+                const task = localTasks.find(t => t.projectId === projectId && t.taskId === taskId);
+                if (!task) {
+                    throw new Error('Task not found');
+                }
+
+                // If online, try to update server first
+                if (!isOffline) {
+                    const response = await fetch(`${apiUrl}/api/projects/tasks?projectId=${projectId}&&taskId=${taskId}`, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${localStorage.getItem("sessionToken")}`
+                        },
+                        body: JSON.stringify({ status: newStatus })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('Failed to update task status on server');
+                    }
+
+                    // Only update locally if server update was successful
+                    task.status = newStatus;
+                    saveToLocalStorage(localTasks);
+                    updateTaskList(localTasks);
+                    renderCalendar();
+                } else {
+                    // If offline, update locally and queue for sync
+                    task.status = newStatus;
+                    saveToLocalStorage(localTasks);
+                    updateTaskList(localTasks);
+                    renderCalendar();
+                    handleOfflineChange('task_update', { projectId, taskId, status: newStatus });
+                }
+            } catch (error) {
+                console.error('Error syncing task status:', error);
+                showNotification("Error", "Failed to sync task status", "error");
+            }
+        }
+
+        // Function to check and update task statuses
+        async function checkAndUpdateTaskStatuses() {
+            for (const task of localTasks) {
+                if (task.status === 'Done') continue; // Skip completed tasks
+                
+                const newStatus = getAutoStatus(task.startDate, task.endDate);
+                if (newStatus !== task.status) {
+                    await syncTask(task.projectId, task.taskId, newStatus);
+                }
+            }
+        }
+
+        // Function to start deadline checking
+        function startDeadlineChecking() {
+            // Check deadlines immediately
+            checkDeadlines();
+            
+            // Then check every hour
+            setInterval(checkDeadlines, 60 * 60 * 1000);
+        }
+
+        // Improve task detail modal
+        function showTaskDetails(task) {
+            const modal = document.createElement('div');
+            modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
+            modal.innerHTML = `
+                <div class="relative mx-auto p-5 border w-full max-w-md shadow-lg rounded-md bg-white">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-lg font-medium text-gray-800">Task Details</h3>
+                        <button class="text-gray-400 hover:text-gray-500 close-modal">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                    <div class="space-y-4">
+                        <div>
+                            <h4 class="text-sm font-medium text-gray-500">Task Name</h4>
+                            <p class="mt-1 text-gray-900">${task.name}</p>
+                        </div>
+                        <div>
+                            <h4 class="text-sm font-medium text-gray-500">Project</h4>
+                            <p class="mt-1 text-gray-900">${task.projectName || 'N/A'}</p>
+                        </div>
+                        <div>
+                            <h4 class="text-sm font-medium text-gray-500">Status</h4>
+                            <p class="mt-1">
+                                <span class="px-2 py-1 rounded text-white text-xs" 
+                                    style="background-color: ${getTaskColor(task.status)}">${task.status}</span>
+                            </p>
+                        </div>
+                        ${task.deliverable ? `
+                            <div>
+                                <h4 class="text-sm font-medium text-gray-500">Deliverable</h4>
+                                <p class="mt-1 text-gray-900">${task.deliverable}</p>
+                            </div>
+                        ` : ''}
+                        <div>
+                            <h4 class="text-sm font-medium text-gray-500">Start Date</h4>
+                            <p class="mt-1 text-gray-900">${formatDateUTC(task.startDate)}</p>
+                        </div>
+                        <div>
+                            <h4 class="text-sm font-medium text-gray-500">End Date</h4>
+                            <p class="mt-1 text-gray-900">${formatDateUTC(task.endDate)}</p>
+                        </div>
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-3">
+                        ${task.status !== 'Done' ? 
+                            `<button onclick="markAsDone('${task.projectId}', '${task.taskId}')" 
+                                    class="btn btn-success">
+                                <i class="fas fa-check mr-1"></i> Mark Done
+                            </button>` : ''}
+                        <button onclick="deleteTask('${task.projectId}', '${task.taskId}')" 
+                                class="btn btn-danger">
+                            <i class="fas fa-trash-alt mr-1"></i> Delete
+                        </button>
+                        <button class="btn btn-secondary close-modal">Close</button>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+            
+            modal.addEventListener('click', function(e) {
+                if (e.target === modal || e.target.classList.contains('close-modal')) {
+                    modal.remove();
+                }
+            });
+        }
 
     // Update sync button state
     function updateSyncButtonState() {
@@ -359,52 +632,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }, 5000);
     }
 
-    window.openLoginModal = function() {
-        document.getElementById("loginModal").classList.remove("hidden");
-    }
-
     function closeLoginModal() {
         document.getElementById("loginModal").classList.add("hidden");
-    }
-
-    window.loginUser = function() {
-        const action = "login";
-        const email = document.getElementById("emailInput").value;
-        const password = document.getElementById("passwordInput").value;
-        
-        if (!email || !password) {
-            showNotification("Error", "Please enter both email and password", "error");
-            return;
-        }
-        
-        fetch(`${apiUrl}/api/auth`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action, email, password })
-        })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error("Login failed");
-            }
-            return response.json();
-        })
-        .then(data => {
-            authToken = data.token;
-            localStorage.setItem("sessionToken", data.token);
-            
-            currentUser = data.userId;
-            localStorage.setItem("userId", data.userId);
-            localStorage.setItem("userEmail", data.email);
-
-            updateUserStatus();
-            updateSyncButtonState();
-            closeLoginModal();
-            syncTasks();
-            showNotification("Login successful", "Welcome back!", "success");
-        })
-        .catch(error => {
-            showNotification("Login failed", error.message, "error");
-        });
     }
 
     async function updateUserStatus() {
@@ -619,11 +848,6 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // Add sync button click handler
-    syncButton.addEventListener('click', async () => {
-        await syncTasks();
-    });
-
     function updateTaskList(tasks) {
         if (!tasksContainer) return;
         
@@ -780,89 +1004,6 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (error) {
             console.error('Error rendering calendar:', error);
             calendarEl.innerHTML = '<p class="text-red-500 p-4">Error loading calendar. Please try again later.</p>';
-        }
-    }
-
-    window.markAsDone = async function(projectId, taskId) {
-        try {
-            const task = localTasks.find(t => t.projectId === projectId && t.taskId === taskId);
-            if (!task) {
-                throw new Error('Task not found');
-            }
-
-            // If online, try to update server first
-            if (!isOffline) {
-                const response = await fetch(`${apiUrl}/api/projects/tasks?projectId=${projectId}&&taskId=${taskId}`, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${localStorage.getItem("sessionToken")}`
-                    },
-                    body: JSON.stringify({ status: 'Done' })
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to update task status on server');
-                }
-
-                // Only update locally if server update was successful
-                task.status = 'Done';
-                saveToLocalStorage(localTasks);
-                updateTaskList(localTasks);
-                renderCalendar();
-                showNotification("Success", "Task marked as done!", "success");
-            } else {
-                // If offline, update locally and queue for sync
-                task.status = 'Done';
-                saveToLocalStorage(localTasks);
-                updateTaskList(localTasks);
-                renderCalendar();
-                handleOfflineChange('task_update', { projectId, taskId, status: 'Done' });
-                showNotification("Success", "Task marked as done (offline mode)", "success");
-            }
-        } catch (error) {
-            console.error('Error marking task as done:', error);
-            showNotification("Error", "Failed to mark task as done", "error");
-            
-            // If the error was due to server failure, revert the local change
-            if (task && task.status === 'Done') {
-                task.status = task.previousStatus || 'Ongoing';
-                saveToLocalStorage(localTasks);
-                updateTaskList(localTasks);
-                renderCalendar();
-            }
-        }
-    }
-
-    window.deleteTask = async function(projectId, taskId) {
-        try {
-            // Remove locally first
-            localTasks = localTasks.filter(t => !(t.projectId === projectId && t.taskId === taskId));
-            saveToLocalStorage(localTasks);
-            updateTaskList(localTasks);
-            renderCalendar(); // Refresh calendar immediately
-
-            // Try to delete on server if online
-            if (!isOffline) {
-                const response = await fetch(`${apiUrl}/api/projects/tasks?projectId=${projectId}&&taskId=${taskId}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'Authorization': `Bearer ${localStorage.getItem("sessionToken")}`
-                    }
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to delete task');
-                }
-            } else {
-                // Store change for later sync
-                handleOfflineChange('task_delete', { projectId, taskId });
-            }
-
-            showNotification("Success", "Task deleted successfully", "success");
-        } catch (error) {
-            console.error('Error deleting task:', error);
-            showNotification("Error", "Failed to delete task", "error");
         }
     }
        
@@ -1094,131 +1235,9 @@ document.addEventListener("DOMContentLoaded", () => {
     function connectWebSocket() {
         if (currentUser) {
             initializeSocketIO();
-        }
-    }
-
-    // Update the logout function to disconnect all sockets
-    window.logout = function() {
-        // Disconnect all sockets
-        if (projectsSocket) projectsSocket.disconnect();
-        if (tasksSocket) tasksSocket.disconnect();
-        if (usersSocket) usersSocket.disconnect();
-        if (commentsSocket) commentsSocket.disconnect();
-        if (notificationsSocket) notificationsSocket.disconnect();
-        
-        // Clear all local storage
-        localStorage.removeItem("sessionToken");
-        localStorage.removeItem("userId");
-        localStorage.removeItem("userEmail");
-        localStorage.removeItem("tasks");
-        localStorage.removeItem("offlineChanges");
-        
-        // Update UI
-        updateUserStatus();
-        updateSyncButtonState();
-        
-        // Show notification
-        showNotification("Logged Out", "You have been successfully logged out", "success");
-        
-        // Clear tasks and calendar
-        localTasks = [];
-        updateTaskList(localTasks);
-        if (calendar) {
-            calendar.removeAllEvents();
-        }
-    }
-
-    // Add showView function back
-    window.showView = function(view) {
-        const calendarView = document.getElementById("calendarView");
-        const tasksView = document.getElementById("tasksView");
-        
-        if (view === 'calendar') {
-            calendarView.classList.remove("hidden");
-            tasksView.classList.add("hidden");
-            renderCalendar();
-        } else if (view === 'tasks') {
-            tasksView.classList.remove("hidden");
-            calendarView.classList.add("hidden");
-            updateTaskList(localTasks);
-        }
-    }
-
-    // Improve task detail modal
-    function showTaskDetails(task) {
-        const modal = document.createElement('div');
-        modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
-        modal.innerHTML = `
-            <div class="relative mx-auto p-5 border w-full max-w-md shadow-lg rounded-md bg-white">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-lg font-medium text-gray-800">Task Details</h3>
-                    <button class="text-gray-400 hover:text-gray-500 close-modal">
-                        <i class="fas fa-times"></i>
-                    </button>
-                </div>
-                <div class="space-y-4">
-                    <div>
-                        <h4 class="text-sm font-medium text-gray-500">Task Name</h4>
-                        <p class="mt-1 text-gray-900">${task.name}</p>
-                    </div>
-                    <div>
-                        <h4 class="text-sm font-medium text-gray-500">Project</h4>
-                        <p class="mt-1 text-gray-900">${task.projectName || 'N/A'}</p>
-                    </div>
-                    <div>
-                        <h4 class="text-sm font-medium text-gray-500">Status</h4>
-                        <p class="mt-1">
-                            <span class="px-2 py-1 rounded text-white text-xs" 
-                                style="background-color: ${getTaskColor(task.status)}">${task.status}</span>
-                        </p>
-                    </div>
-                    ${task.deliverable ? `
-                        <div>
-                            <h4 class="text-sm font-medium text-gray-500">Deliverable</h4>
-                            <p class="mt-1 text-gray-900">${task.deliverable}</p>
-                        </div>
-                    ` : ''}
-                    <div>
-                        <h4 class="text-sm font-medium text-gray-500">Start Date</h4>
-                        <p class="mt-1 text-gray-900">${formatDateUTC(task.startDate)}</p>
-                    </div>
-                    <div>
-                        <h4 class="text-sm font-medium text-gray-500">End Date</h4>
-                        <p class="mt-1 text-gray-900">${formatDateUTC(task.endDate)}</p>
-                    </div>
-                </div>
-                <div class="mt-6 flex justify-end space-x-3">
-                    ${task.status !== 'Done' ? 
-                        `<button onclick="markAsDone('${task.projectId}', '${task.taskId}')" 
-                                class="btn btn-success">
-                            <i class="fas fa-check mr-1"></i> Mark Done
-                        </button>` : ''}
-                    <button onclick="deleteTask('${task.projectId}', '${task.taskId}')" 
-                            class="btn btn-danger">
-                        <i class="fas fa-trash-alt mr-1"></i> Delete
-                    </button>
-                    <button class="btn btn-secondary close-modal">Close</button>
-                </div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-        
-        modal.addEventListener('click', function(e) {
-            if (e.target === modal || e.target.classList.contains('close-modal')) {
-                modal.remove();
             }
-        });
-    }
+        }
 
-    // Initialize the app
-    loadLocalData();
-    updateUserStatus();
-    updateSyncButtonState();
-    if (calendar) {
-        renderCalendar();
-    }
-});
     </script>
 </body>
 </html>
